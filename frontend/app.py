@@ -36,7 +36,7 @@ st.markdown("""
 
 class ClinicalCDSSFrontend:
     def __init__(self):
-        self.backend_url = "http://localhost:8000"
+        self.backend_url = "https://genai-powered-clinical-decision-support.onrender.com"
         self.initialize_session_state()
     
     def initialize_session_state(self):
