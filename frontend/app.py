@@ -271,10 +271,7 @@ class ClinicalCDSSFrontend:
                     
                     if backend_available:
                         response = requests.post(
-    f"{self.backend_url}/analyze",
-    json=patient_data,
-    timeout=30
-)
+                            f"{self.backend_url}/diagnose", json={"patient_data": patient_data}, timeout=30)   
                         
                         if response.status_code == 200:
                             diagnosis_data = response.json()
