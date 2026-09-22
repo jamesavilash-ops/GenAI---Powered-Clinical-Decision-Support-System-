@@ -1,6 +1,8 @@
 import streamlit as st
 import requests
 import json
+import io
+import csv
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -57,6 +59,29 @@ st.markdown("""
 
 
 # ============================================================
+# SMALL HELPERS
+# ============================================================
+
+def safe_pct(value, default=0.0):
+    """
+    Safely coerce a value to a percentage-formatted string.
+    Falls back gracefully instead of raising if the backend
+    returns something missing, None, or non-numeric.
+    """
+    try:
+        return f"{float(value):.1%}"
+    except (TypeError, ValueError):
+        return f"{default:.1%}"
+
+
+def safe_float(value, default=0.0):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+# ============================================================
 # MAIN FRONTEND CLASS
 # ============================================================
 
@@ -81,6 +106,13 @@ class ClinicalCDSSFrontend:
         self.backend_url = (
             "https://genai-powered-clinical-decision-support.onrender.com"
         )
+
+        # Render's free tier can take 30-60+ seconds to wake a
+        # sleeping service. A short health-check timeout makes a
+        # perfectly healthy backend look "down" and falls back to
+        # demo mode unnecessarily.
+        self.health_timeout = 60
+        self.diagnosis_timeout = 120
 
         self.initialize_session_state()
 
@@ -130,6 +162,14 @@ class ClinicalCDSSFrontend:
     # ========================================================
 
     def render_sidebar(self):
+        """
+        NOTE: this is called from main() *after* a diagnosis has
+        been processed for this run (if any), not before. Streamlit
+        renders sidebar content into the sidebar regardless of where
+        in the script it's called, so this ordering fix means the
+        metrics panel reflects the patient that was *just* diagnosed
+        instead of lagging one interaction behind.
+        """
 
         with st.sidebar:
 
@@ -160,7 +200,7 @@ class ClinicalCDSSFrontend:
                     response = requests.get(
                         f"{self.backend_url}/metrics/"
                         f"{st.session_state.current_patient}",
-                        timeout=20
+                        timeout=self.health_timeout
                     )
 
                     if response.status_code == 200:
@@ -181,6 +221,28 @@ class ClinicalCDSSFrontend:
                     st.info(
                         "Performance metrics are currently unavailable."
                     )
+
+            else:
+
+                st.caption("Run a diagnosis to see performance metrics here.")
+
+            # ----------------------------------------------------
+            # Recent patients (previously tracked but never shown)
+            # ----------------------------------------------------
+
+            if st.session_state.diagnosis_history:
+
+                st.header("Recent Patients")
+
+                for entry in reversed(st.session_state.diagnosis_history[-5:]):
+
+                    pid = entry.get("patient_id", "Unknown")
+                    conf = entry.get(
+                        "overall_confidence",
+                        entry.get("confidence_scores", {}).get("overall", 0)
+                    )
+
+                    st.write(f"• {pid} — {safe_pct(conf)} confidence")
 
 
     # ========================================================
@@ -203,9 +265,9 @@ class ClinicalCDSSFrontend:
         ]
 
         values = [
-            metrics.get("precision", 0),
-            metrics.get("recall", 0),
-            metrics.get("f1_score", 0)
+            safe_float(metrics.get("precision", 0)),
+            safe_float(metrics.get("recall", 0)),
+            safe_float(metrics.get("f1_score", 0))
         ]
 
         fig.add_trace(
@@ -226,9 +288,9 @@ class ClinicalCDSSFrontend:
         ]
 
         text_values = [
-            metrics.get("bleu_score", 0),
-            metrics.get("rouge_score", 0),
-            metrics.get("mrr", 0)
+            safe_float(metrics.get("bleu_score", 0)),
+            safe_float(metrics.get("rouge_score", 0)),
+            safe_float(metrics.get("mrr", 0))
         ]
 
         fig.add_trace(
@@ -371,14 +433,16 @@ class ClinicalCDSSFrontend:
 
         st.header("🔍 AI Diagnosis Results")
 
-        overall_conf = diagnosis_data.get(
-            "overall_confidence",
+        overall_conf = safe_float(
             diagnosis_data.get(
-                "confidence_scores",
-                {}
-            ).get(
-                "overall",
-                0
+                "overall_confidence",
+                diagnosis_data.get(
+                    "confidence_scores",
+                    {}
+                ).get(
+                    "overall",
+                    0
+                )
             )
         )
 
@@ -436,17 +500,21 @@ class ClinicalCDSSFrontend:
                         )
                     )
 
-                    probability = diagnosis.get(
-                        "probability",
+                    probability = safe_float(
                         diagnosis.get(
-                            "confidence_score",
-                            0
+                            "probability",
+                            diagnosis.get(
+                                "confidence_score",
+                                0
+                            )
                         )
                     )
 
-                    confidence = diagnosis.get(
-                        "confidence",
-                        probability
+                    confidence = safe_float(
+                        diagnosis.get(
+                            "confidence",
+                            probability
+                        )
                     )
 
                     st.markdown(
@@ -611,9 +679,8 @@ class ClinicalCDSSFrontend:
                         "Treatment"
                     )
 
-                    treatment_confidence = treatment.get(
-                        "confidence",
-                        0
+                    treatment_confidence = safe_float(
+                        treatment.get("confidence", 0)
                     )
 
                     with st.expander(
@@ -745,7 +812,7 @@ class ClinicalCDSSFrontend:
 
             response = requests.get(
                 health_url,
-                timeout=20
+                timeout=self.health_timeout
             )
 
             if response.status_code == 200:
@@ -760,9 +827,10 @@ class ClinicalCDSSFrontend:
         except requests.exceptions.Timeout:
 
             return False, (
-                "Render backend timed out after "
-                "20 seconds. The service may still "
-                "be waking up."
+                f"Render backend timed out after "
+                f"{self.health_timeout} seconds. The service may "
+                "still be waking up from a cold start — try again "
+                "in about a minute."
             )
 
         except requests.exceptions.ConnectionError as e:
@@ -806,7 +874,7 @@ class ClinicalCDSSFrontend:
             response = requests.post(
                 diagnosis_url,
                 json=payload,
-                timeout=120
+                timeout=self.diagnosis_timeout
             )
 
             if response.status_code == 200:
@@ -822,8 +890,8 @@ class ClinicalCDSSFrontend:
         except requests.exceptions.Timeout:
 
             return False, (
-                "Diagnosis request timed out after "
-                "120 seconds."
+                f"Diagnosis request timed out after "
+                f"{self.diagnosis_timeout} seconds."
             )
 
         except requests.exceptions.ConnectionError as e:
@@ -854,11 +922,11 @@ class ClinicalCDSSFrontend:
 
         self.render_header()
 
-        self.render_sidebar()
-
         patient_data = (
             self.render_patient_input_form()
         )
+
+        diagnosis_data = None
 
         if patient_data:
 
@@ -913,6 +981,10 @@ class ClinicalCDSSFrontend:
                         "but the diagnosis request "
                         "returned an error."
                     )
+
+                    # Still render the sidebar before exiting so the
+                    # UI stays consistent.
+                    self.render_sidebar()
 
                     return
 
@@ -982,6 +1054,16 @@ class ClinicalCDSSFrontend:
                 self.render_export_section(
                     diagnosis_data
                 )
+
+        # ----------------------------------------------------
+        # Sidebar is rendered last so that, when a diagnosis was
+        # just processed in this run, st.session_state.current_patient
+        # already reflects it -- Streamlit places sidebar content into
+        # the sidebar regardless of call order, so this removes the
+        # one-run lag the metrics panel used to have.
+        # ----------------------------------------------------
+
+        self.render_sidebar()
 
 
     # ========================================================
@@ -1250,9 +1332,6 @@ class ClinicalCDSSFrontend:
         diagnosis_data
     ):
 
-        import io
-        import csv
-
         output = io.StringIO()
 
         writer = csv.writer(
@@ -1279,7 +1358,7 @@ class ClinicalCDSSFrontend:
         writer.writerow(
             [
                 "Overall Confidence",
-                f"{diagnosis_data.get('overall_confidence', 0):.1%}"
+                safe_pct(diagnosis_data.get("overall_confidence", 0))
             ]
         )
 
@@ -1298,31 +1377,32 @@ class ClinicalCDSSFrontend:
             []
         ):
 
+            # NOTE: these values are computed on their own lines
+            # (not as multi-line expressions inside an f-string)
+            # because f-strings only allow a multi-line expression
+            # inside {} on Python 3.12+ (PEP 701). Keeping this
+            # simple avoids a SyntaxError on Python 3.9-3.11, which
+            # is what most Streamlit hosting still runs.
+            disease_name = diagnosis.get(
+                "disease",
+                diagnosis.get("disease_name", "Unknown")
+            )
+
+            probability = diagnosis.get(
+                "probability",
+                diagnosis.get("confidence_score", 0)
+            )
+
+            confidence = diagnosis.get(
+                "confidence",
+                diagnosis.get("confidence_score", 0)
+            )
+
             writer.writerow(
                 [
-                    diagnosis.get(
-                        "disease",
-                        diagnosis.get(
-                            "disease_name",
-                            "Unknown"
-                        )
-                    ),
-
-                    f"{diagnosis.get(
-                        'probability',
-                        diagnosis.get(
-                            'confidence_score',
-                            0
-                        )
-                    ):.1%}",
-
-                    f"{diagnosis.get(
-                        'confidence',
-                        diagnosis.get(
-                            'confidence_score',
-                            0
-                        )
-                    ):.1%}"
+                    disease_name,
+                    safe_pct(probability),
+                    safe_pct(confidence)
                 ]
             )
 
@@ -1338,4 +1418,3 @@ if __name__ == "__main__":
     frontend = ClinicalCDSSFrontend()
 
     frontend.main()
-```
